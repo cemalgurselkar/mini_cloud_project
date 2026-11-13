@@ -1,0 +1,46 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-22.04"
+
+  machines = {
+    "gateway" => {
+      ip: "192.168.57.2",
+      memory: 2048
+    },
+    "app-01" => {
+      ip: "192.168.57.11",
+      memory: 2048
+    },
+    "app-02" => {
+      ip: "192.168.57.12",
+      memory: 2048
+    },
+    "db-01" => {
+      ip: "192.168.57.20",
+      memory: 1024
+    }
+  }
+
+  machines.each do |name, settings|
+    config.vm.define name do |node|
+      node.vm.hostname = name
+
+      node.vm.provider "virtualbox" do |vb|
+        vb.name = "mini-cloud-#{name}"
+        vb.memory = settings[:memory]
+        vb.cpus = 2
+      end
+
+      # Internal Network
+      node.vm.network "private_network",
+        ip: settings[:ip],
+        virtualbox__intnet: "private-net"
+
+      # Gateway management network
+      if name == "gateway"
+        node.vm.network "private_network",
+          ip: "192.168.56.2",
+          virtualbox__hostonly: "vboxnet0"
+      end
+    end
+  end
+end

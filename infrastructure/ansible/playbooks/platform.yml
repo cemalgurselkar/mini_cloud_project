@@ -1,0 +1,159 @@
+- name: Deploy FastAPI application servers
+  hosts: apps
+  become: true
+
+  vars:
+    app_dir: /opt/mini-cloud-api
+    compose_version: "v2.32.4"
+    db_password: "{{ lookup('env', 'MINI_CLOUD_DB_PASSWORD') }}"
+
+  tasks:
+    - name: Ensure database password is provided
+      ansible.builtin.assert:
+        that:
+          - db_password | length > 0
+        fail_msg: "MINI_CLOUD_DB_PASSWORD environment variable is missing."
+      no_log: true
+
+    - name: Install Docker
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - ca-certificates
+        state: present
+        update_cache: true
+
+    - name: Enable Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Create Docker CLI plugin directory
+      ansible.builtin.file:
+        path: /usr/local/lib/docker/cli-plugins
+        state: directory
+        mode: "0755"
+
+    - name: Install Docker Compose plugin
+      ansible.builtin.get_url:
+        url: "https://github.com/docker/compose/releases/download/{{ compose_version }}/docker-compose-linux-{{ 'x86_64' if ansible_architecture == 'x86_64' else 'aarch64' }}"
+        dest: /usr/local/lib/docker/cli-plugins/docker-compose
+        mode: "0755"
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy application files
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../app/{{ item }}"
+        dest: "{{ app_dir }}/{{ item }}"
+        mode: "0644"
+      loop:
+        - Dockerfile
+        - .dockerignore
+        - compose.yaml
+        - requirements.txt
+        - main.py
+        - db.py
+        - models.py
+        - schemas.py
+
+    - name: Configure database connection
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/.env"
+        mode: "0600"
+        content: |
+          DB_HOST=192.168.57.20
+          DB_PORT=5432
+          DB_NAME=notesdb
+          DB_USER=noteuser
+          DB_PASSWORD={{ db_password }}
+      no_log: true
+
+    - name: Deploy FastAPI container
+      ansible.builtin.command:
+        cmd: docker compose up -d --build --wait
+        chdir: "{{ app_dir }}"
+      changed_when: true
+
+    - name: Verify FastAPI health
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8000/health
+        status_code: 200
+      register: api_health
+      retries: 5
+      delay: 3
+      until: api_health.status == 200
+
+
+- name: Configure HAProxy Gateway
+  hosts: gateways
+  become: true
+
+  tasks:
+    - name: Install HAProxy
+      ansible.builtin.apt:
+        name: haproxy
+        state: present
+        update_cache: true
+
+    - name: Configure HAProxy
+      ansible.builtin.copy:
+        dest: /etc/haproxy/haproxy.cfg
+        mode: "0644"
+        content: |
+          global
+              log /dev/log local0
+              maxconn 2000
+
+          defaults
+              mode http
+              timeout connect 5s
+              timeout client 30s
+              timeout server 30s
+
+          frontend http_front
+              bind 192.168.56.2:8080
+              default_backend fastapi_servers
+
+          backend fastapi_servers
+              balance roundrobin
+              option httpchk GET /health
+              http-check expect status 200
+
+              server app01 192.168.57.11:8000 check
+              server app02 192.168.57.12:8000 check
+      notify: Restart HAProxy
+
+    - name: Validate HAProxy configuration
+      ansible.builtin.command:
+        cmd: haproxy -c -f /etc/haproxy/haproxy.cfg
+      changed_when: false
+
+    - name: Allow HTTP traffic from host
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: eth2
+        src: 192.168.56.1
+        port: "8080"
+        proto: tcp
+
+    - name: Enable HAProxy service
+      ansible.builtin.systemd:
+        name: haproxy
+        enabled: true
+        state: started
+
+    - name: Apply HAProxy configuration
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Restart HAProxy
+      ansible.builtin.systemd:
+        name: haproxy
+        state: restarted

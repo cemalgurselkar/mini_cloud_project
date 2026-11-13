@@ -1,0 +1,104 @@
+- name: Configure VM observability
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Install Node Exporter and rsyslog
+      ansible.builtin.apt:
+        name:
+          - prometheus-node-exporter
+          - rsyslog
+        state: present
+        update_cache: true
+
+    - name: Enable monitoring services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - prometheus-node-exporter
+        - rsyslog
+
+    - name: Forward system logs to host Alloy
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/60-mini-cloud.conf
+        mode: "0644"
+        content: |
+          *.* action(
+            type="omfwd"
+            target="192.168.56.1"
+            port="1514"
+            protocol="tcp"
+            action.resumeRetryCount="-1"
+            queue.type="linkedList"
+            queue.size="10000"
+          )
+      notify: Restart rsyslog
+
+  handlers:
+    - name: Restart rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+
+
+- name: Configure gateway monitoring firewall
+  hosts: gateways
+  become: true
+
+  tasks:
+    - name: Allow monitoring traffic between host and internal network
+      community.general.ufw:
+        rule: allow
+        route: true
+        direction: in
+        interface_in: eth2
+        interface_out: eth1
+        src: 192.168.56.1
+        dest: 192.168.57.0/24
+        port: "9100"
+        proto: tcp
+
+    - name: Allow VM log forwarding to host
+      community.general.ufw:
+        rule: allow
+        route: true
+        direction: in
+        interface_in: eth1
+        interface_out: eth2
+        src: 192.168.57.0/24
+        dest: 192.168.56.1
+        port: "1514"
+        proto: tcp
+
+
+- name: Configure internal VM route to monitoring host
+  hosts: apps:databases
+  become: true
+
+  tasks:
+    - name: Create persistent monitoring route service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/monitoring-route.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Route monitoring traffic through gateway
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/sbin/ip route replace 192.168.56.1/32 via 192.168.57.2
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable monitoring route
+      ansible.builtin.systemd:
+        name: monitoring-route.service
+        daemon_reload: true
+        enabled: true
+        state: started
